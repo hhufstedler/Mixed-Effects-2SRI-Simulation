@@ -28,10 +28,10 @@ Each scenario runs 1,000 replications, for 52,000 total simulation replications.
 
 Set `results_folder` name and run the entire script. Results are written incrementally to `metadata.csv`.
 
-## Citation
+## Citation 
 
 If you use this code or the simulation results, please cite the archived software release and associated manuscript.
 
-Archived software release: DOI to be added after Zenodo archive is created.
+Archived software release: Zenodo DOI: 10.5281/zenodo.20022540
 
 Associated manuscript: Hufstedler, H. (2026). [Mixed-Effects Two-Stage Residual Inclusion Methods for Individual Patient Data Meta-Analysis: A Methodological Framework for Causal Inference in Survival Analysis]. [Research Synthesis Methods]. Manuscript ID: [RSM-2025-0247.R2].
