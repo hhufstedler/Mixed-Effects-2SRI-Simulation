@@ -1,39 +1,74 @@
-# ---------- Setup ----------
-results_folder <- "name_of_folder"
-if (!dir.exists(results_folder)) dir.create(results_folder)
+# 2SRI Simulation Pipeline — ADEMP-compliant 
+
+library(dplyr)
+library(lubridate)
+library(survival)
+library(coxme)
+library(lme4)
+library(ggplot2)
+library(scales)
+library(tidyr)
+library(readr)
+library(stringr)
+library(purrr)
+library(hexbin)
+library(patchwork)
+library(cowplot)
+library(knitr)
+library(kableExtra)
+safe_colorblind_palette <- c("#88CCEE", "#CC6677", "#DDCC77", "#117733", "#332288", "#AA4499",
+                             "#44AA99", "#999933", "#882255", "#661100", "#6699CC", "#888888")
+scales::show_col(safe_colorblind_palette)
+
+results_folder <- "simulation_outputs" 
+if (!dir.exists(results_folder)) dir.create(results_folder, recursive = TRUE)
 
 # Progress settings
-progress_every <- 10                                # print every 10 seeds in console
+progress_every <- 10                                
 progress_log   <- file.path(results_folder, "progress.log")
 
-# ADEMP guidelines: seed once; log RNG state per repetition
+# ADEMP: seed ONCE; log RNG state per repetition
 set.seed(12345)
 rng_path <- file.path(results_folder, "rng_states.rds")
 rng_log  <- if (file.exists(rng_path)) readRDS(rng_path) else list()
 
-# Minimal per-rep table (Estimates dataset) with CIs & coverage
+# per-repetition results table
 metadata_path <- file.path(results_folder, "metadata.csv")
+
 if (!file.exists(metadata_path)) {
   write.table(
     data.frame(
-      seed_idx = integer(), batch_id = integer(),
-      pattern = character(), iv_strength = numeric(), confounding = character(),
-
-      estimate_2sri = numeric(), se_2sri = numeric(),
+      seed_idx = integer(),
+      batch_id = integer(),
+      pattern = character(),
+      iv_strength = numeric(),
+      confounding = character(),
+      violation_type = character(),
+      
+      estimate_2sri = numeric(),
+      se_2sri = numeric(),
       p_value_2sri = numeric(),
-
-      estimate_naive = numeric(), se_naive = numeric(),
+      
+      estimate_naive = numeric(),
+      se_naive = numeric(),
       p_value_naive = numeric(),
-
-      wald_stat = numeric(), p_value_wald = numeric(),
+      
+      wald_stat = numeric(),
+      p_value_wald = numeric(),
       first_stage_warnings = logical(),
       convergence_success = logical(),
       runtime_sec = numeric(),
-      success = logical(), error_msg = character()
+      success = logical(),
+      error_msg = character()
     ),
-    file = metadata_path, sep = ",", row.names = FALSE, col.names = TRUE, append = FALSE
+    file = metadata_path,
+    sep = ",",
+    row.names = FALSE,
+    col.names = TRUE,
+    append = FALSE
   )
 }
+
 completed_df <- tryCatch(read.csv(metadata_path), error = function(e) NULL)
 
 
@@ -45,7 +80,10 @@ FIXED <- list(
   beta_measurement_error = 0.1,
   beta_age = 0.005,
   beta_sex = 0.1,
-  meas_error_sd = 0.2
+  meas_error_sd = 0.2,
+  # parameters for IV assumption-violation scenarios
+  exclusion_gamma = 0.08,
+  independence_alpha = 0.2
 )
 
 confounding_map <- list(
@@ -60,7 +98,20 @@ param_tracker <- expand.grid(
   pattern = c("1", "2", "3"),
   iv_strength = c(0.3, 0.5, 0.8, 1.0),
   confounding = c("weak", "moderate", "strong", "vstrong"),
+  violation_type = "valid",
   stringsAsFactors = FALSE
+)
+
+# IV assumption violation scenarios
+param_tracker <- bind_rows(
+  param_tracker,
+  expand.grid(
+    pattern = "1",
+    iv_strength = 0.8,
+    confounding = c("strong", "vstrong"),
+    violation_type = c("exclusion", "independence"),
+    stringsAsFactors = FALSE
+  )
 )
 param_tracker$batch_id <- seq_len(nrow(param_tracker))
 
@@ -79,55 +130,68 @@ get_pattern_probs <- function(pattern, n_studies) {
 run_single_rep <- function(seed_idx, params, fixed_params) {
   start_time <- Sys.time()
   tryCatch({
-    # RNG state advances naturally per ADEMP guidelines
-
+    # NO set.seed() here (per ADEMP)
+    
     # Unpack
     pattern <- params$pattern
     iv_strength <- params$iv_strength
     conf <- params$confounding
+    violation_type <- if (!is.null(params$violation_type)) params$violation_type else "valid"
+    gamma_excl <- if (violation_type == "exclusion") fixed_params$exclusion_gamma else 0
+    alpha_indep <- if (violation_type == "independence") fixed_params$independence_alpha else 0
     beta_U_treat <- confounding_map[[conf]]["beta_U_treat"]
     beta_U_death <- confounding_map[[conf]]["beta_U_death"]
     study_sizes <- fixed_params$study_sizes
     n_studies <- fixed_params$n_studies
     n_patients <- sum(study_sizes)
-
+    
     # Dates & ranges
     admission_start <- ymd("2025-01-01"); admission_end <- ymd("2025-12-30")
     min_age <- 18; max_age <- 80
-
+    
     # Study effects
     study_ids <- seq_len(n_studies)
     study_effect_treatment <- runif(n_studies, -0.1, 0.1)
     study_effect_survival  <- runif(n_studies, -0.2, 0.2)
     study <- rep(study_ids, times = study_sizes)
-
+    
     # Generate dataset
     df <- data.frame(
       id = seq_len(n_patients),
       study = study,
       age = sample(min_age:max_age, n_patients, replace = TRUE),
       sex = sample(c("Male", "Female"), n_patients, replace = TRUE),
-      iv = rbinom(n_patients, 1, prob = get_pattern_probs(pattern, n_studies)[study]),
       U = rnorm(n_patients, mean = 0, sd = 0.5),
       admission_date = sample(seq(admission_start, admission_end, by = "day"), n_patients, replace = TRUE),
       measurement_error = rnorm(n_patients, mean = 0, sd = fixed_params$meas_error_sd)
-    ) %>%
+    )
+    
+    # Step 2: Generate IV
+    base_prob <- get_pattern_probs(pattern, n_studies)[df$study]
+    if (alpha_indep > 0) {
+      df$iv <- rbinom(n_patients, 1, prob = plogis(qlogis(base_prob) + alpha_indep * df$U))
+    } else {
+      df$iv <- rbinom(n_patients, 1, prob = base_prob)
+    }
+    
+    # Step 3: Generate admission month
+    df <- df %>%
       mutate(admission_month = floor_date(admission_date, "month"))
-
+    
     # Month effects
     month_noise <- data.frame(
       admission_month = seq(ymd("2025-01-01"), ymd("2025-12-01"), by = "1 month"),
       month_effect_treatment = rnorm(12, mean = 0, sd = 0.15),
       month_effect_survival  = rnorm(12, mean = 0, sd = 0.15)
     )
-
-    # Join & generate treated/outcomes
+    
+    # Generate treatment and outcome variables
     df <- df %>%
       left_join(month_noise, by = "admission_month") %>%
       mutate(
         study_effect_treatment = study_effect_treatment[study],
         study_effect_survival  = study_effect_survival[study],
-
+        
         log_odds_treatment = -0.2 +
           iv_strength * iv +
           study_effect_treatment + month_effect_treatment +
@@ -135,18 +199,20 @@ run_single_rep <- function(seed_idx, params, fixed_params) {
           fixed_params$beta_measurement_error * measurement_error,
         p_treat = plogis(log_odds_treatment),
         treated = rbinom(n(), 1, prob = p_treat),
-
+        
         log_hazard_death = -4.2 +
           study_effect_survival + month_effect_survival +
           fixed_params$treatment_effect * treated +
           fixed_params$beta_age * age + fixed_params$beta_sex * (sex == "Male") +
-          beta_U_death * U,
+          beta_U_death * U +
+          gamma_excl * iv,
         log_hazard_discharge = -1.1 -
           study_effect_survival - month_effect_survival -
           fixed_params$treatment_effect * treated -
           fixed_params$beta_age * age - fixed_params$beta_sex * (sex == "Male") -
-          beta_U_death * U,
-
+          beta_U_death * U -
+          gamma_excl * iv,
+        
         hazard_death = exp(log_hazard_death),
         hazard_discharge = exp(log_hazard_discharge),
         time_to_death = rweibull(n(), shape = 1.2, scale = 0.45 / hazard_death),
@@ -158,43 +224,43 @@ run_single_rep <- function(seed_idx, params, fixed_params) {
         study = factor(study),
         admission_month = factor(admission_month)
       )
-
-    # First stage (suppress console output, retain warning capture)
+    
+    # First stage treatment model, silence singular messages
     fs_fit <- suppressWarnings(
       glmer(
         treated ~ iv + age + sex + (1 | study) + (1 | admission_month),
         family = binomial(),
         data = df,
-        control = glmerControl(check.conv.singular = "ignore")  # silence singular messages
+        control = glmerControl(check.conv.singular = "ignore") 
       )
     )
-
+    
     z_iv <- summary(fs_fit)$coefficients["iv", "z value"]
     wald_stat <- as.numeric(z_iv)^2
     p_value_wald <- 1 - pchisq(wald_stat, df = 1)
-
+    
     df$residual_treatment <- residuals(fs_fit, type = "response")
-
+    
     # Capture whether there were boundary/convergence issues
     msgs <- tryCatch(fs_fit@optinfo$conv$lme4$messages, error = function(e) NULL)
     first_stage_warnings <- !is.null(msgs) && any(grepl("boundary|singular|convergence", msgs, ignore.case = TRUE))
-
+    
     # Second stage
     m_2sri <- coxme(Surv(observed_time, event) ~ treated + residual_treatment +
                       age + sex + (1 | study) + (1 | admission_month), data = df)
     m_naive <- coxme(Surv(observed_time, event) ~ treated +
                        age + sex + (1 | study) + (1 | admission_month), data = df)
-
+    
     est_2sri <- fixef(m_2sri)["treated"]
     se_2sri  <- sqrt(diag(vcov(m_2sri)))["treated"]
     z_2sri   <- as.numeric(est_2sri / se_2sri)
     p_value_2sri <- 2 * (1 - pnorm(abs(z_2sri)))
-
+    
     est_naive <- fixef(m_naive)["treated"]
     se_naive  <- sqrt(diag(vcov(m_naive)))["treated"]
     z_naive   <- as.numeric(est_naive / se_naive)
     p_value_naive <- 2 * (1 - pnorm(abs(z_naive)))
-
+    
     list(
       success = TRUE, seed_idx = seed_idx, params = params,
       metrics = list(
@@ -206,7 +272,7 @@ run_single_rep <- function(seed_idx, params, fixed_params) {
         runtime_sec = as.numeric(difftime(Sys.time(), start_time, units = "secs"))
       )
     )
-
+    
   }, error = function(e) {
     list(
       success = FALSE, seed_idx = seed_idx, params = params,
@@ -215,7 +281,6 @@ run_single_rep <- function(seed_idx, params, fixed_params) {
   })
 }
 
-# row writer 
 log_row <- function(result, filepath = metadata_path) {
   if (result$success) {
     m <- result$metrics
@@ -225,12 +290,13 @@ log_row <- function(result, filepath = metadata_path) {
       pattern = result$params$pattern,
       iv_strength = result$params$iv_strength,
       confounding = result$params$confounding,
-
+      violation_type = if (!is.null(result$params$violation_type)) result$params$violation_type else "valid",
+      
       estimate_2sri = m$estimate_2sri, se_2sri = m$se_2sri, p_value_2sri = m$p_value_2sri,
       estimate_naive = m$estimate_naive, se_naive = m$se_naive, p_value_naive = m$p_value_naive,
-
+      
       wald_stat = m$wald_stat, p_value_wald = m$p_value_wald,
-
+      
       first_stage_warnings = m$first_stage_warnings,
       convergence_success = m$convergence_success,
       runtime_sec = m$runtime_sec,
@@ -243,12 +309,13 @@ log_row <- function(result, filepath = metadata_path) {
       pattern = result$params$pattern,
       iv_strength = result$params$iv_strength,
       confounding = result$params$confounding,
-
+      violation_type = if (!is.null(result$params$violation_type)) result$params$violation_type else "valid",
+      
       estimate_2sri = NA, se_2sri = NA, p_value_2sri = NA,
       estimate_naive = NA, se_naive = NA, p_value_naive = NA,
-
+      
       wald_stat = NA, p_value_wald = NA,
-
+      
       first_stage_warnings = NA,
       convergence_success = FALSE,
       runtime_sec = NA,
@@ -260,43 +327,43 @@ log_row <- function(result, filepath = metadata_path) {
   invisible(row)
 }
 
-# ---------- Serial ADEMP loop ----------
+# ---------- Serial ADEMP loop (no seed matrix; store RNG state per rep) ----------
 n_batches <- nrow(param_tracker)
 
 for (i in seq_len(n_batches)) {
   current_params <- param_tracker[i, ]
-
-  # -------- PROGRESS: batch header --------
+  
+  # -------- Print and log batch progress while running --------
   batch_header <- sprintf(
     "Batch %d/%d | pattern=%s | iv_strength=%.2f | confounding=%s",
     i, n_batches, current_params$pattern, current_params$iv_strength, current_params$confounding
   )
   cat(batch_header, "\n")
   write(batch_header, file = progress_log, append = TRUE)
-
+  
   for (seed_idx in seq_len(seeds_per_batch)) {
-
-    # Resume-safe skip
+    
+    # skip those already completed
     if (!is.null(completed_df) &&
         any(completed_df$batch_id == current_params$batch_id &
             completed_df$seed_idx == seed_idx)) next
-
-    # Store RNG state for reproducibility
+    
+    # Store RNG state BEFORE repetition
     rng_log[[length(rng_log) + 1]] <- .Random.seed
-
+    
     # Run one repetition
     result <- run_single_rep(seed_idx = seed_idx, params = current_params, fixed_params = FIXED)
-
-    # Write one row immediately
+    
+    # Write one row 
     log_row(result, filepath = metadata_path)
-
-    # -------- PROGRESS: seed tick --------
+    
+    # -------- Print and log progress  --------
     if ((seed_idx %% progress_every) == 0L) {
       tick <- sprintf("  ...seed %d/%d done", seed_idx, seeds_per_batch)
       cat(tick, "\n")
       write(tick, file = progress_log, append = TRUE)
     }
-
+    
     # Checkpoint periodically
     if ((seed_idx %% progress_every) == 0L) {
       saveRDS(rng_log, rng_path)
@@ -310,5 +377,1100 @@ for (i in seq_len(n_batches)) {
 rng_log[[length(rng_log) + 1]] <- .Random.seed
 saveRDS(rng_log, rng_path)
 
-cat("All batches complete.\n")
-write("All batches complete.", file = progress_log, append = TRUE)
+
+
+###############################################################################
+###############################################################################
+### Pre-analysis visualizations + MAIN figs/tables (ADEMP)
+###############################################################################
+###############################################################################
+
+
+# --------- Output paths ---------
+metadata_path <- file.path(results_folder, "metadata.csv")
+out_dir <- file.path(results_folder, "preanalysis")
+
+dir.create(out_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_plot <- function(p, filename, w = 12, h = 8, dpi = 300) {
+  ggplot2::ggsave(
+    filename = file.path(out_dir, filename),
+    plot = p, width = w, height = h, dpi = dpi, bg = "white", device = "png"
+  )
+}
+
+# --------- Read metadata ---------
+md_all_raw <- read.csv(metadata_path, colClasses = "character")
+
+# Coerce to proper types
+md_all <- md_all_raw %>%
+  mutate(
+    estimate_2sri   = as.numeric(estimate_2sri),
+    estimate_naive  = as.numeric(estimate_naive),
+    se_2sri         = as.numeric(se_2sri),
+    se_naive        = as.numeric(se_naive),
+    p_value_2sri    = as.numeric(p_value_2sri),
+    p_value_naive   = as.numeric(p_value_naive),
+    wald_stat       = as.numeric(wald_stat),
+    p_value_wald    = as.numeric(p_value_wald),
+    runtime_sec     = as.numeric(runtime_sec),
+    first_stage_warnings = as.logical(first_stage_warnings),
+    convergence_success  = as.logical(convergence_success),
+    success              = as.logical(success)
+  )
+
+table(md_all$violation_type, useNA = "ifany")
+
+# --------- Label normalization ---------
+true_effect <- -0.4
+iv_levels   <- c(0.3, 0.5, 0.8, 1.0)                      # DGM values 
+conf_int    <- c("weak","moderate","strong","vstrong")    # internal
+conf_disp   <- c("weak","moderate","strong","very strong")
+
+norm_conf <- function(x) {
+  x2 <- tolower(trimws(as.character(x)))
+  dplyr::case_when(
+    x2 %in% c("very strong","verystrong","v strong","v-strong","v_strong",
+              "v.strong","very_strong","vstrong") ~ "vstrong",
+    x2 %in% c("strong","str")   ~ "strong",
+    x2 %in% c("moderate","mod","med") ~ "moderate",
+    x2 %in% c("weak","wk")      ~ "weak",
+    TRUE                        ~ x2
+  )
+}
+
+md <- md_all %>%
+  mutate(
+    pattern     = as.character(pattern),
+    confounding = factor(norm_conf(confounding), levels = conf_int, ordered = TRUE),
+    confounding_disp = factor(
+      ifelse(as.character(confounding) == "vstrong", "very strong", as.character(confounding)),
+      levels = conf_disp, ordered = TRUE
+    ),
+    iv_strength = as.numeric(iv_strength),
+    iv_strength_fac = factor(iv_strength, levels = iv_levels,
+                             labels = sprintf("%.1f", iv_levels), ordered = TRUE)
+  )
+
+
+# --------- NA / missing data checks ---------
+# Missing error messages are expected for successful repetitions
+tolerated_na <- c("error_msg")  
+
+# Column-wise NA report 
+na_report <- md %>%
+  summarise(across(everything(), ~ sum(is.na(.)), .names = "na_{.col}")) %>%
+  tidyr::pivot_longer(everything(), names_to = "column", values_to = "na_count") %>%
+  mutate(column = sub("^na_", "", column),
+         total_rows = nrow(md),
+         na_pct = 100 * na_count / total_rows)
+readr::write_csv(na_report, file.path(out_dir, "na_report_by_column.csv"))
+
+na_rows_success <- md %>%
+  filter(success %in% TRUE) %>%
+  select(-any_of(tolerated_na)) %>%
+  filter(if_any(everything(), is.na))
+
+if (nrow(na_rows_success) > 0) {
+  readr::write_csv(
+    head(na_rows_success, 200),
+    file.path(out_dir, "na_rows_success_with_missing_values_head200.csv")
+  )
+}
+
+cat(sprintf(
+  "Missing-data check: %d/%d successful repetitions contain unexpected missing values.\n",
+  nrow(na_rows_success),
+  sum(md$success %in% TRUE, na.rm = TRUE)
+))
+
+
+# --------- Keep successful reps for plotting ---------
+md_ok_all <- md %>% filter(success %in% TRUE)
+md_ok <- md_ok_all %>% filter(is.na(violation_type) | violation_type == "valid")
+
+# =========================
+# Long and wide datasets
+# =========================
+long <- md_ok %>%
+  pivot_longer(
+    cols = c(estimate_2sri, estimate_naive, se_2sri, se_naive, p_value_2sri, p_value_naive),
+    names_to = c(".value","method"),
+    names_pattern = "(estimate|se|p_value)_(2sri|naive)"
+  ) %>%
+  mutate(
+    method   = ifelse(method == "2sri", "2SRI", "Naive"),
+    ciL      = estimate - 1.96 * se,
+    ciU      = estimate + 1.96 * se,
+    cover    = as.integer(ciL <= true_effect & ciU >= true_effect),
+    z        = (estimate - true_effect) / pmax(se, .Machine$double.eps),
+    abs_z    = abs(z),
+    ci_width = ciU - ciL
+  )
+
+wide_methods <- long %>%
+  dplyr::select(dplyr::any_of(c(
+    "batch_id","seed_idx","pattern","iv_strength","iv_strength_fac",
+    "confounding","confounding_disp","method","estimate","se"
+  ))) %>%
+  tidyr::pivot_wider(names_from = method,
+                     values_from = c(estimate, se),
+                     names_sep = "__") %>%
+  dplyr::filter(is.finite(estimate__Naive), is.finite(estimate__2SRI))
+
+facet_scales  <- "free"
+facet_formula  <- confounding_disp ~ iv_strength_fac
+
+# =========================
+# (1) Univariate β̂
+# =========================
+p1 <- ggplot(long, aes(x = estimate, fill = method)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 40) +
+  geom_vline(xintercept = true_effect, linetype = 2) +
+  facet_grid(facet_formula, scales = facet_scales) +
+  labs(title = expression("Univariate distribution of " * hat(beta)),
+       x = expression(hat(beta)), y = "Count") +
+  theme_minimal()
+save_plot(p1, "01_univariate_estimates.png")
+
+# (1b) Univariate SE(β̂)
+p1b <- ggplot(long, aes(x = se, fill = method)) +
+  geom_histogram(alpha = 0.6, position = "identity", bins = 40) +
+  facet_grid(facet_formula, scales = facet_scales) +
+  labs(title = "Univariate distribution of SE(hat(beta))",
+       x = "SE(hat(beta))", y = "Count") +
+  theme_minimal()
+save_plot(p1b, "01b_univariate_ses.png")
+
+# (2) β̂ vs SE(β̂)
+p2 <- ggplot(long, aes(x = se, y = estimate, color = method)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_smooth(se = FALSE, method = "loess") +
+  geom_hline(yintercept = true_effect, linetype = 2) +
+  facet_grid(facet_formula, scales = facet_scales) +
+  labs(title = expression(hat(beta) * " vs SE(" * hat(beta) * ")"),
+       x = "SE(hat(beta))", y = expression(hat(beta))) +
+  theme_minimal()
+save_plot(p2, "02_beta_vs_se.png")
+
+# (2b) density variant
+p2_den <- ggplot(long, aes(x = se, y = estimate)) +
+  stat_density_2d_filled(contour_var = "ndensity", alpha = 0.9) +
+  geom_hline(yintercept = true_effect, linetype = 2) +
+  facet_grid(confounding_disp ~ iv_strength_fac + method, scales = "free") +
+  labs(title = expression(hat(beta) * " vs SE(" * hat(beta) * ") (density)"),
+       x = "SE(hat(beta))", y = expression(hat(beta))) +
+  theme_minimal()
+save_plot(p2_den, "02b_beta_vs_se_density.png", w = 14, h = 9)
+
+# (3) 2SRI vs Naive scatter
+p3 <- ggplot(wide_methods, aes(x = estimate__Naive, y = estimate__2SRI)) +
+  geom_point(alpha = 0.35, size = 1) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  geom_vline(xintercept = true_effect, linetype = 3) +
+  geom_hline(yintercept = true_effect, linetype = 3) +
+  facet_grid(confounding_disp ~ iv_strength_fac, scales = facet_scales) +
+  labs(title = expression(hat(beta)["2SRI"] ~ "vs" ~ hat(beta)["Naive"]),
+       x = expression(hat(beta)["Naive"]), y = expression(hat(beta)["2SRI"])) +
+  theme_minimal()
+save_plot(p3, "03_2sri_vs_naive.png")
+
+# (3b) hex-binned alternative
+p3_hex <- ggplot(wide_methods, aes(x = estimate__Naive, y = estimate__2SRI)) +
+  geom_hex(bins = 50) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  geom_vline(xintercept = true_effect, linetype = 3) +
+  geom_hline(yintercept = true_effect, linetype = 3) +
+  facet_grid(confounding_disp ~ iv_strength_fac, scales = facet_scales) +
+  labs(title = expression(hat(beta)["2SRI"] ~ "vs" ~ hat(beta)["Naive"] ~ "(hex bins)"),
+       x = expression(hat(beta)["Naive"]), y = expression(hat(beta)["2SRI"])) +
+  theme_minimal()
+save_plot(p3_hex, "03b_2sri_vs_naive_hex.png")
+
+# (3c) density-contour overlay
+p3_den <- ggplot(wide_methods, aes(x = estimate__Naive, y = estimate__2SRI)) +
+  geom_point(alpha = 0.1, size = 0.6) +
+  stat_density_2d(color = "black", alpha = 0.6) +
+  geom_abline(slope = 1, intercept = 0, linetype = 2) +
+  geom_vline(xintercept = true_effect, linetype = 3) +
+  geom_hline(yintercept = true_effect, linetype = 3) +
+  facet_grid(confounding_disp ~ iv_strength_fac, scales = facet_scales) +
+  labs(title = expression(hat(beta)["2SRI"] ~ "vs" ~ hat(beta)["Naive"] ~ "(density)"),
+       x = expression(hat(beta)["Naive"]), y = expression(hat(beta)["2SRI"])) +
+  theme_minimal()
+save_plot(p3_den, "03c_2sri_vs_naive_density.png")
+
+# (4) Bland–Altman
+wide_methods <- wide_methods %>%
+  mutate(mean_est = 0.5 * (estimate__2SRI + estimate__Naive),
+         diff_est = estimate__2SRI - estimate__Naive)
+
+ba_stats <- wide_methods %>%
+  group_by(iv_strength_fac, confounding_disp) %>%
+  summarise(mu = mean(diff_est, na.rm = TRUE),
+            sd = stats::sd(diff_est, na.rm = TRUE), .groups = "drop") %>%
+  mutate(loA_low = mu - 1.96*sd, loA_high = mu + 1.96*sd)
+
+p4 <- ggplot(wide_methods, aes(x = mean_est, y = diff_est)) +
+  geom_point(alpha = 0.35, size = 1) +
+  facet_grid(confounding_disp ~ iv_strength_fac, scales = facet_scales) +
+  geom_hline(yintercept = 0, linetype = 3) +
+  geom_hline(data = ba_stats, aes(yintercept = mu), linetype = 1) +
+  geom_hline(data = ba_stats, aes(yintercept = loA_low), linetype = 2) +
+  geom_hline(data = ba_stats, aes(yintercept = loA_high), linetype = 2) +
+  labs(title = "Bland–Altman: 2SRI – Naive vs mean",
+       x = "Mean(2SRI, Naive)", y = "Difference (2SRI − Naive)") +
+  theme_minimal()
+save_plot(p4, "04_bland_altman.png")
+
+# (5) Zip plot
+zip_df <- long %>%
+  mutate(zL = z - 1.96, zU = z + 1.96) %>%
+  group_by(pattern, iv_strength_fac, confounding, method) %>%
+  arrange(abs_z, .by_group = TRUE) %>%
+  mutate(rank_frac = row_number() / (n() + 1)) %>%
+  ungroup()
+
+p5 <- ggplot(zip_df,
+             aes(y = rank_frac, yend = rank_frac, x = zL, xend = zU, color = cover == 1)) +
+  geom_segment(alpha = 0.6) +
+  scale_color_manual(values = c("TRUE" = "#332288", "FALSE" = "#CC6677"),
+                     labels = c("TRUE" = "Cover", "FALSE" = "Miss"), name = "CI") +
+  facet_grid(confounding_disp ~ iv_strength_fac + method, scales = "free_x") +
+  labs(title = "Zip plot (standardized CI, ranked by |z|)",
+       x = "Standardized CI (z-scale; 0 = truth)", y = "Fractional rank by |z|") +
+  theme_minimal()
+save_plot(p5, "05_zip_plot.png", w = 14, h = 9)
+
+
+# -------------------------
+# Pattern-specific exports
+# -------------------------
+for (pat in sort(unique(md_ok$pattern))) {
+  long_pat <- long %>% filter(pattern == pat)
+  wide_pat <- wide_methods %>% filter(pattern == pat)
+  
+  save_plot(p1 %+% long_pat  + labs(subtitle = paste("Pattern", pat)),
+            sprintf("01_univariate_estimates_pat%s.png", pat))
+  save_plot(p1b %+% long_pat + labs(subtitle = paste("Pattern", pat)),
+            sprintf("01b_univariate_ses_pat%s.png", pat))
+  save_plot(p2 %+% long_pat  + labs(subtitle = paste("Pattern", pat)),
+            sprintf("02_beta_vs_se_pat%s.png", pat))
+  save_plot(p3 %+% wide_pat  + labs(subtitle = paste("Pattern", pat)),
+            sprintf("03_2sri_vs_naive_pat%s.png", pat))
+  save_plot(p4 %+% wide_pat  + labs(subtitle = paste("Pattern", pat)),
+            sprintf("04_bland_altman_pat%s.png", pat))
+  save_plot(p5 %+% (zip_df %>% filter(pattern == pat)) +
+              labs(subtitle = paste("Pattern", pat)),
+            sprintf("05_zip_plot_pat%s.png", pat), w = 14, h = 9)
+}
+
+##############################################################
+## Appendix figures: multi-panel plots by IV pattern
+## Produces readable combined figures for all patterns and pattern-specific subsets.
+##############################################################
+
+patterns <- sort(unique(as.character(md_ok$pattern)))
+
+clean_theme <- function(base_size = 10) {
+  ggplot2::theme_minimal(base_size = base_size) +
+    ggplot2::theme(
+      legend.position = "none",
+      plot.title = ggplot2::element_text(size = base_size + 1, hjust = 0.5, face = "bold"),
+      axis.title.x = ggplot2::element_text(size = base_size - 1),
+      axis.title.y = ggplot2::element_text(size = base_size - 1),
+      axis.text    = ggplot2::element_text(size = base_size - 2),
+      strip.text   = ggplot2::element_text(size = base_size - 2),
+      plot.margin  = ggplot2::margin(5, 5, 5, 5)
+    )
+}
+
+# combined appendix panels
+create_readable_panel <- function(base_plot, metric_name, filename_base, use_vertical = FALSE) {
+  
+  # 1) All-patterns plot
+  all_patterns_plot <- base_plot + clean_theme() + ggplot2::labs(title = "All Patterns", subtitle = NULL)
+  
+  # 2) Pattern-specific plots 
+  pattern_plots <- vector("list", length(patterns))
+  for (i in seq_along(patterns)) {
+    pat <- patterns[i]
+    if (metric_name %in% c("Distribution of Estimates",
+                           "Distribution of Standard Errors",
+                           "Estimates vs Standard Errors")) {
+      filtered_data <- dplyr::filter(long, pattern == pat)
+      pattern_plots[[i]] <- base_plot %+% filtered_data + clean_theme() +
+        ggplot2::labs(title = paste("Pattern", pat), subtitle = NULL)
+      
+    } else if (metric_name %in% c("Method Comparison",
+                                  "Bland-Altman Agreement")) {
+      filtered_data <- dplyr::filter(wide_methods, pattern == pat)
+      pattern_plots[[i]] <- base_plot %+% filtered_data + clean_theme() +
+        ggplot2::labs(title = paste("Pattern", pat), subtitle = NULL)
+      
+    } else if (metric_name == "Confidence Interval Coverage") {
+      filtered_data <- dplyr::filter(zip_df, pattern == pat)
+      pattern_plots[[i]] <- base_plot %+% filtered_data + clean_theme() +
+        ggplot2::labs(title = paste("Pattern", pat), subtitle = NULL)
+      
+    } else {
+      # default to long format
+      filtered_data <- dplyr::filter(long, pattern == pat)
+      pattern_plots[[i]] <- base_plot %+% filtered_data + clean_theme() +
+        ggplot2::labs(title = paste("Pattern", pat), subtitle = NULL)
+    }
+  }
+  
+  # 3) Arrange: "All Patterns" + one per pattern 
+  panels <- c(list(all_patterns_plot), pattern_plots)
+  
+  # layout sizing 
+  n_panels <- length(panels)
+  if (use_vertical) {
+    # vertical layout with up to three panels per row
+    ncol <- min(3, n_panels)
+    nrow <- ceiling(n_panels / ncol)
+    plot_width  <- 8 * ncol
+    plot_height <- 6 * nrow + 2
+    panel_fig <- patchwork::wrap_plots(panels, ncol = ncol)
+  } else {
+    # horizontal row with up to five panels per row
+    ncol <- min(5, n_panels)
+    nrow <- ceiling(n_panels / ncol)
+    plot_width  <- 6 * ncol     # ~6 inches per panel
+    plot_height <- 5 * nrow + 2 
+    panel_fig <- patchwork::wrap_plots(panels, ncol = ncol)
+  }
+  
+  # 4) Legend extraction
+  legend <- tryCatch(
+    cowplot::get_legend(base_plot + ggplot2::theme(legend.position = "bottom")),
+    error = function(e) NULL
+  )
+  
+  if (!is.null(legend)) {
+    panel_fig <- panel_fig / legend + patchwork::plot_layout(heights = c(10, 1))
+  }
+  
+  panel_fig <- panel_fig + patchwork::plot_annotation(
+    title = metric_name,
+    theme = ggplot2::theme(plot.title = ggplot2::element_text(size = 20, hjust = 0.5, face = "bold"))
+  )
+  
+  save_plot(panel_fig, paste0(filename_base, "_5panel_readable.png"),
+            w = plot_width, h = plot_height)
+  panel_fig
+}
+
+# wrapper for vertical layout
+create_vertical_panel <- function(base_plot, metric_name, filename_base) {
+  create_readable_panel(base_plot, metric_name, filename_base, use_vertical = TRUE)
+}
+
+
+univariate_panel <- create_readable_panel(
+  p1, "Distribution of Estimates", "01_univariate_estimates"
+)
+
+univariate_se_panel <- create_readable_panel(
+  p1b, "Distribution of Standard Errors", "01b_univariate_ses"
+)
+
+beta_vs_se_panel <- create_readable_panel(
+  p2, "Estimates vs Standard Errors", "02_beta_vs_se"
+)
+
+method_comparison_panel <- create_readable_panel(
+  p3, "Method Comparison", "03_2sri_vs_naive"
+)
+
+bland_altman_panel <- create_readable_panel(
+  p4, "Bland-Altman Agreement", "04_bland_altman"
+)
+
+coverage_panel <- create_readable_panel(
+  p5, "Confidence Interval Coverage", "05_zip_plot"
+)
+
+# vertical alternates
+univariate_panel_vert <- create_vertical_panel(
+  p1, "Distribution of Estimates", "01_univariate_estimates_vertical"
+)
+
+coverage_panel_vert <- create_vertical_panel(
+  p5, "Confidence Interval Coverage", "05_zip_plot_vertical"
+)
+
+
+#####################################################################
+### 4-panel main composite
+#####################################################################
+p1_main <- p1 + labs(title = "Distribution of Estimates", subtitle = NULL)
+p2_main <- p2 + labs(title = "Estimates vs Standard Errors", subtitle = NULL)
+p3_main <- p3 + labs(title = "Method Comparison", subtitle = NULL)
+p5_main <- p5 + labs(title = "Confidence Interval Coverage", subtitle = NULL)
+
+main_panel <- (p1_main | p5_main) / (p2_main | p3_main)
+main_panel <- main_panel + plot_annotation(
+  title = "Simulation Results: 2SRI vs Naive (All Patterns)",
+  theme = theme(plot.title = element_text(size = 16, hjust = 0.5, face = "bold"))
+)
+save_plot(main_panel, "main_results_4panel.png", w = 18, h = 12)
+
+
+###############################################################################
+# MAIN RESULTS (ADEMP): Confounding × Realized IV strength (ALL patterns)
+###############################################################################
+
+main_root_fig <- file.path(results_folder, "main results - all patterns")
+main_fig_dir  <- file.path(main_root_fig, "figures")
+dir.create(main_fig_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_main <- function(p, filename, w = 14, h = 10, dpi = 300) {
+  ggplot2::ggsave(
+    filename = file.path(main_fig_dir, filename),
+    plot = p, width = w, height = h, dpi = dpi, bg = "white", device = "png"
+  )
+}
+
+# long data format simulation results for figures
+m_long_fig <- bind_rows(
+  md_ok %>% transmute(pattern, seed_idx, iv_strength_fac, confounding,
+                      wald_stat, method = "2SRI", estimate = estimate_2sri, se = se_2sri),
+  md_ok %>% transmute(pattern, seed_idx, iv_strength_fac, confounding,
+                      wald_stat, method = "Naive", estimate = estimate_naive, se = se_naive)
+) %>%
+  mutate(
+    ciL = estimate - 1.96 * se,
+    ciU = estimate + 1.96 * se,
+    cover = as.integer(ciL <= true_effect & ciU >= true_effect),
+    ci_len = ciU - ciL,
+    bias = estimate - true_effect,
+    sq_error = (estimate - true_effect)^2,
+    conf_lab = factor(ifelse(as.character(confounding) == "vstrong","very strong",
+                             as.character(confounding)),
+                      levels = c("weak","moderate","strong","very strong"), ordered = TRUE)
+  )
+
+# Quintile bins of realized strength by confounding levels
+bin_quintiles <- function(x) {
+  if (all(is.na(x))) return(factor(rep(NA, length(x)), levels = paste0("Q", 1:5)))
+  qs <- unique(stats::quantile(x, probs = seq(0, 1, 0.2), na.rm = TRUE))
+  if (length(qs) == 1) return(factor(rep("Q3", length(x)), levels = paste0("Q", 1:5)))
+  if (length(qs) < 6) {
+    xj <- x + rnorm(length(x), sd = 1e-9)
+    qs <- stats::quantile(xj, probs = seq(0, 1, 0.2), na.rm = TRUE)
+  }
+  cut(x, breaks = qs, include.lowest = TRUE, labels = paste0("Q", 1:5))
+}
+
+m_bins <- m_long_fig %>%
+  group_by(conf_lab) %>%                       
+  mutate(realized_bin = bin_quintiles(wald_stat)) %>%
+  ungroup() %>%
+  filter(!is.na(realized_bin)) %>%
+  mutate(method = factor(method, levels = c("2SRI","Naive")))
+
+# Cell summaries + MCSEs
+cell_stats <- m_bins %>%
+  group_by(conf_lab, realized_bin, method) %>%
+  summarise(
+    n = n(),
+    mean_est = mean(estimate, na.rm = TRUE),
+    
+    # Relative bias (%)
+    rel_bias_pct = abs(mean_est - true_effect) / abs(true_effect) * 100,
+    mcse_mean    = sd(estimate, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    mcse_relbias = (mcse_mean / abs(true_effect)) * 100,
+    rel_L        = pmax(0, rel_bias_pct - 1.96 * mcse_relbias),
+    rel_U        = rel_bias_pct + 1.96 * mcse_relbias,
+    
+    # Empirical SE
+    emp_se   = sd(estimate, na.rm = TRUE),
+    mcse_emp = ifelse(n > 1, emp_se / sqrt(2 * (n - 1)), NA_real_),
+    emp_L    = pmax(0, emp_se - 1.96 * mcse_emp),
+    emp_U    = emp_se + 1.96 * mcse_emp,
+    
+    # MSE
+    mse      = mean((estimate - true_effect)^2, na.rm = TRUE),
+    mcse_mse = sd((estimate - true_effect)^2, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    mse_L    = pmax(0, mse - 1.96 * mcse_mse),
+    mse_U    = mse + 1.96 * mcse_mse,
+    
+    # Coverage
+    coverage = mean(cover, na.rm = TRUE),
+    mcse_cov = sqrt(coverage * (1 - coverage) / pmax(n, 1)),
+    cov_L    = pmin(pmax(coverage - 1.96 * mcse_cov, 0), 1),
+    cov_U    = pmin(pmax(coverage + 1.96 * mcse_cov, 0), 1),
+    .groups = "drop"
+  )
+
+forest_theme <- theme_minimal(base_size = 12) +
+  theme(
+    panel.border     = element_rect(color = "grey50", fill = NA, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey92", color = "grey75"),
+    strip.text       = element_text(face = "bold"),
+    panel.spacing.x  = unit(1.1, "lines"),
+    panel.spacing.y  = unit(0.8, "lines")
+  )
+
+# Relative bias (%)
+p_rel <- ggplot(cell_stats, aes(y = method, x = rel_bias_pct)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = rel_L, xmax = rel_U), height = 0.22) +
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.3) +
+  facet_grid(conf_lab ~ realized_bin, scales = "free_x") +
+  scale_x_continuous(name = "Relative bias (%)", expand = expansion(mult = c(0.03, 0.06))) +
+  labs(title = "Relative bias (%)") + forest_theme
+save_main(p_rel, "MAIN_forest_relative_bias_pct.png")
+
+# Empirical SE
+p_empse <- ggplot(cell_stats, aes(y = method, x = emp_se)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = emp_L, xmax = emp_U), height = 0.22) +
+  facet_grid(conf_lab ~ realized_bin, scales = "free_x") +
+  scale_x_continuous(name = "Empirical SE", expand = expansion(mult = c(0.03, 0.06))) +
+  labs(title = "Empirical SE") + forest_theme
+save_main(p_empse, "MAIN_forest_empirical_se.png")
+
+# MSE
+p_mse <- ggplot(cell_stats, aes(y = method, x = mse)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = mse_L, xmax = mse_U), height = 0.22) +
+  facet_grid(conf_lab ~ realized_bin, scales = "free_x") +
+  scale_x_continuous(name = "MSE", expand = expansion(mult = c(0.03, 0.06))) +
+  labs(title = "Mean squared error (MSE)") + forest_theme
+save_main(p_mse, "MAIN_forest_mse.png")
+
+# Coverage
+p_cov <- ggplot(cell_stats, aes(y = method, x = coverage)) +
+  geom_point(size = 2) +
+  geom_errorbarh(aes(xmin = cov_L, xmax = cov_U), height = 0.22) +
+  geom_vline(xintercept = 0.95, linetype = 3, linewidth = 0.4) +
+  facet_grid(conf_lab ~ realized_bin, scales = "free_x") +
+  scale_x_continuous(
+    name   = "Coverage",
+    limits = c(0, 1), breaks = seq(0, 1, 0.25), minor_breaks = NULL,
+    labels = percent_format(accuracy = 1),
+    expand = expansion(mult = c(0.03, 0.06))
+  ) +
+  labs(title = "Coverage (95% CI)") + forest_theme
+save_main(p_cov, "MAIN_forest_coverage.png")
+
+
+###############################################################################
+# MAIN TABLES (ADEMP): Conf × IV-strength (design), and Conf × IV × Pattern
+###############################################################################
+
+main_root_tbl <- file.path(results_folder, "main results - ALL")
+main_tbl_dir  <- file.path(main_root_tbl, "tables")
+dir.create(main_root_tbl, recursive = TRUE, showWarnings = FALSE)
+dir.create(main_tbl_dir,  recursive = TRUE, showWarnings = FALSE)
+
+# Long data tables
+m_long_tbl <- bind_rows(
+  md_ok %>% transmute(batch_id, seed_idx, pattern,
+                      iv_strength_fac, confounding, wald_stat,
+                      method = "2SRI", estimate = estimate_2sri, se = se_2sri, p = p_value_2sri),
+  md_ok %>% transmute(batch_id, seed_idx, pattern,
+                      iv_strength_fac, confounding, wald_stat,
+                      method = "Naive", estimate = estimate_naive, se = se_naive, p = p_value_naive)
+) %>%
+  mutate(
+    ciL    = estimate - 1.96 * se,
+    ciU    = estimate + 1.96 * se,
+    cover  = as.integer(ciL <= true_effect & ciU >= true_effect),
+    ci_len = ciU - ciL
+  )
+
+fmt_pm <- function(x, se, digits_val = 3, digits_se = 3, pct = FALSE){
+  if (pct) {
+    paste0(sprintf("%.1f\\%%", 100*x), " (", sprintf("%.1f\\%%", 100*se), ")")
+  } else {
+    paste0(formatC(x, format = "f", digits = digits_val),
+           " (", formatC(se, format = "f", digits = digits_se), ")")
+  }
+}
+
+# TABLE A: confounding × iv_strength × method  (all patterns pooled)
+tab_design <- m_long_tbl %>%
+  mutate(conf_lab = factor(ifelse(as.character(confounding) == "vstrong","very strong",
+                                  as.character(confounding)),
+                           levels = c("weak","moderate","strong","very strong"), ordered = TRUE)) %>%
+  group_by(conf_lab, iv_strength_fac, method) %>%
+  summarise(
+    n            = n(),
+    mean_est     = mean(estimate, na.rm = TRUE),
+    rel_bias_pct = abs(mean_est - true_effect) / abs(true_effect) * 100,
+    mcse_relbias = (sd(estimate, na.rm = TRUE) / sqrt(pmax(n, 1))) / abs(true_effect) * 100,
+    emp_se       = sd(estimate, na.rm = TRUE),
+    mcse_emp     = ifelse(n > 1, emp_se / sqrt(2 * (n - 1)), NA_real_),
+    mse          = mean((estimate - true_effect)^2, na.rm = TRUE),
+    mcse_mse     = sd((estimate - true_effect)^2, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    precision    = mean(ci_len, na.rm = TRUE),
+    mcse_prec    = sd(ci_len, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    coverage     = mean(cover, na.rm = TRUE),
+    mcse_cov     = sqrt(pmax(coverage * (1 - coverage), 0) / pmax(n, 1)),
+    .groups = "drop"
+  ) %>%
+  mutate(method = factor(method, levels = c("2SRI","Naive"))) %>%
+  arrange(conf_lab, iv_strength_fac, method)
+
+readr::write_csv(tab_design, file.path(main_tbl_dir, "ADEMP_main_metrics_by_conf_x_IVstrength_tidy.csv"))
+
+# LaTeX + HTML Table A
+latex_A <- tab_design %>%
+  transmute(
+    Confounding              = conf_lab,
+    `IV strength (design)`   = as.character(iv_strength_fac),
+    Method                   = as.character(method),
+    `Rel. bias (\\%)`        = fmt_pm(rel_bias_pct, mcse_relbias, digits_val = 1, digits_se = 1),
+    `Empirical SE`           = fmt_pm(emp_se,      mcse_emp),
+    `MSE`                    = fmt_pm(mse,         mcse_mse),
+    `Precision (CI width)`   = fmt_pm(precision,   mcse_prec),
+    Coverage                 = fmt_pm(coverage,    mcse_cov, pct = TRUE),
+    n                        = n
+  )
+
+latex_tab_A <- knitr::kable(
+  latex_A, format = "latex", booktabs = TRUE, longtable = TRUE, escape = FALSE,
+  align = c("l","c","c", rep("r",5), "r"),
+  caption = "Performance measures by confounding level and IV strength (design). Entries are point estimates with Monte Carlo standard errors in parentheses."
+) |>
+  kableExtra::add_header_above(c("Scenario" = 3, "Performance measures (value; MCSE)" = 5, "Reps" = 1)) |>
+  kableExtra::kable_styling(latex_options = c("repeat_header"), font_size = 9) |>
+  kableExtra::column_spec(1, width = "1.8cm") |>
+  kableExtra::column_spec(2, width = "1.6cm") |>
+  kableExtra::column_spec(3, width = "1.4cm") |>
+  kableExtra::column_spec(which(names(latex_A) == "Precision (CI width)"), width = "2.2cm")
+kableExtra::save_kable(latex_tab_A, file.path(main_tbl_dir, "ADEMP_metrics_by_IVstrength.tex"))
+
+html_A <- knitr::kable(
+  latex_A, format = "html", booktabs = TRUE, escape = FALSE,
+  align = c("l","c","c", rep("r",5), "r"),
+  caption = "Performance measures by confounding level and IV strength (design)."
+) |>
+  kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped","condensed"))
+kableExtra::save_kable(html_A, file.path(main_tbl_dir, "ADEMP_metrics_by_IVstrength.html"))
+
+# TABLE B: confounding × iv_strength × pattern × method
+tab_knobs <- m_long_tbl %>%
+  mutate(conf_lab = factor(ifelse(as.character(confounding) == "vstrong","very strong",
+                                  as.character(confounding)),
+                           levels = c("weak","moderate","strong","very strong"), ordered = TRUE)) %>%
+  group_by(conf_lab, iv_strength_fac, pattern, method) %>%
+  summarise(
+    n            = n(),
+    mean_est     = mean(estimate, na.rm = TRUE),
+    rel_bias_pct = abs(mean_est - true_effect) / abs(true_effect) * 100,
+    mcse_relbias = (sd(estimate, na.rm = TRUE) / sqrt(pmax(n, 1))) / abs(true_effect) * 100,
+    emp_se       = sd(estimate, na.rm = TRUE),
+    mcse_emp     = ifelse(n > 1, emp_se / sqrt(2 * (n - 1)), NA_real_),
+    mse          = mean((estimate - true_effect)^2, na.rm = TRUE),
+    mcse_mse     = sd((estimate - true_effect)^2, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    precision    = mean(ci_len, na.rm = TRUE),
+    mcse_prec    = sd(ci_len, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    coverage     = mean(cover, na.rm = TRUE),
+    mcse_cov     = sqrt(pmax(coverage * (1 - coverage), 0) / pmax(n, 1)),
+    .groups = "drop"
+  ) %>%
+  mutate(method = factor(method, levels = c("2SRI","Naive"))) %>%
+  arrange(conf_lab, iv_strength_fac, pattern, method)
+
+make_tex <- function(df, conf_lab_disp, outname){
+  latex_df <- df %>%
+    transmute(
+      `IV strength (design)` = as.character(iv_strength_fac),
+      `IV pattern`           = as.character(pattern),
+      Method                 = as.character(method),
+      `Rel. bias (\\%)`      = fmt_pm(rel_bias_pct, mcse_relbias, digits_val = 1, digits_se = 1),
+      `Empirical SE`         = fmt_pm(emp_se,      mcse_emp),
+      `MSE`                  = fmt_pm(mse,         mcse_mse),
+      `Precision (CI width)` = fmt_pm(precision,   mcse_prec),
+      Coverage               = fmt_pm(coverage,    mcse_cov, pct = TRUE),
+      n                      = n
+    )
+  
+  kt_tex <- knitr::kable(
+    latex_df, format = "latex", booktabs = TRUE, longtable = TRUE, escape = FALSE,
+    align = c("l","c","c", rep("r",5), "r"),
+    caption = paste0("Performance measures (", conf_lab_disp,
+                     " confounding). Entries are point estimates with Monte Carlo standard errors in parentheses.")
+  ) |>
+    kableExtra::kable_styling(latex_options = c("repeat_header"), font_size = 9) |>
+    kableExtra::add_header_above(c("Scenario" = 3, "Performance measures (value; MCSE)" = 5, "Reps" = 1)) |>
+    kableExtra::column_spec(1, width = "1.6cm") |>
+    kableExtra::column_spec(2, width = "2.0cm") |>
+    kableExtra::column_spec(3, width = "1.4cm") |>
+    kableExtra::column_spec(4, width = "1.8cm") |>
+    kableExtra::column_spec(7, width = "2.0cm") |>
+    kableExtra::column_spec(9, width = "1.2cm")
+  
+  kableExtra::save_kable(kt_tex, file.path(main_tbl_dir, outname))
+  
+  # HTML version
+  outname_html <- sub("\\.tex$", ".html", outname)
+  kt_html <- knitr::kable(
+    latex_df, format = "html", escape = FALSE,
+    align = c("l","c","c", rep("r",5), "r"),
+    caption = paste0("Performance measures (", conf_lab_disp,
+                     " confounding). Entries are point estimates with Monte Carlo standard errors in parentheses.")
+  ) |>
+    kableExtra::kable_styling(full_width = FALSE, bootstrap_options = c("striped","hover","condensed","responsive")) |>
+    kableExtra::add_header_above(c("Scenario" = 3, "Performance measures (value; MCSE)" = 5, "Reps" = 1)) |>
+    kableExtra::column_spec(1, width = "12em") |>
+    kableExtra::column_spec(2, width = "14em") |>
+    kableExtra::column_spec(3, width = "10em") |>
+    kableExtra::column_spec(4, width = "14em") |>
+    kableExtra::column_spec(7, width = "14em") |>
+    kableExtra::column_spec(9, width = "10em")
+  
+  kableExtra::save_kable(kt_html, file.path(main_tbl_dir, outname_html))
+}
+
+for (lab in c("weak","moderate","strong","very strong")) {
+  make_tex(
+    df            = dplyr::filter(tab_knobs, conf_lab == lab),
+    conf_lab_disp = lab,
+    outname       = paste0("ADEMP_metrics_IVknobs_", gsub(" ", "_", lab), ".tex")
+  )
+}
+
+wrapper <- paste(
+  "\\begingroup\\small\\setlength{\\tabcolsep}{3pt}",
+  paste0("\\input{ADEMP_metrics_IVknobs_", gsub(" ", "_", c("weak","moderate","strong","very strong")), ".tex}", collapse = "\n"),
+  "\\endgroup",
+  sep = "\n"
+)
+writeLines(wrapper, file.path(main_tbl_dir, "ADEMP_metrics_by_conf_x_IVknobs_WRAPPER.tex"))
+
+
+
+###############################################################################
+############################# BRIDGE FIGURES ##################################
+###############################################################################
+
+# Visualize how IV pattern & DGM exposure strength translate into realized first-stage strength
+
+
+bridge_dir <- file.path(results_folder, "bridge_figs")
+dir.create(bridge_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_bridge <- function(p, filename, w = 14, h = 10, dpi = 300) {
+  ggplot2::ggsave(file.path(bridge_dir, filename), plot = p,
+                  width = w, height = h, dpi = dpi, bg = "white")
+}
+
+# display labels
+md_bridge <- md_ok %>%
+  mutate(
+    confounding_disp = factor(
+      ifelse(as.character(confounding) == "vstrong", "very strong", as.character(confounding)),
+      levels = c("weak","moderate","strong","very strong"), ordered = TRUE
+    ),
+    pattern_disp = factor(as.character(pattern),
+                          levels = c("1","2","3"),
+                          labels = c("Pattern 1", "Pattern 2", "Pattern 3")),
+    iv_strength_num = as.numeric(iv_strength),
+    iv_strength_fac = factor(iv_strength_fac, levels = sprintf("%.1f", iv_levels), ordered = TRUE)
+  ) %>%
+  # keep finite walds for plotting
+  filter(is.finite(wald_stat))
+
+# --------------------------
+# Bridge 1: Violin + Box by Pattern, faceted by Confounding × IV DGM
+# --------------------------
+p_bridge1 <- ggplot(md_bridge, aes(x = pattern_disp, y = wald_stat)) +
+  geom_violin(trim = TRUE, alpha = 0.5) +
+  geom_boxplot(width = 0.22, outlier.size = 0.6) +
+  facet_grid(confounding_disp ~ iv_strength_fac, scales = "free_y") +
+  labs(
+    title    = "Realized First-stage Strength by IV Pattern and DGM Exposure",
+    subtitle = "Rows: confounding level · Columns: design IV strength",
+    x = "IV Allocation Pattern",
+    y = expression("Wald "*chi^2*" (df = 1)")
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    strip.text = element_text(face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+save_bridge(p_bridge1, "BRIDGE_wald_violin_box_by_pattern.png", w = 16, h = 11)
+
+# --------------------------
+# Bridge 2: Histograms of Wald with nested facets (Confounding + IV DGM) × Pattern
+# --------------------------
+p_bridge2 <- ggplot(md_bridge, aes(x = wald_stat)) +
+  geom_histogram(bins = 30, alpha = 0.75) +
+  facet_grid(rows = vars(confounding_disp, iv_strength_fac), cols = vars(pattern_disp), scales = "free_y") +
+  labs(
+    title    = "Distribution of Realized First-stage Strength (Wald χ²)",
+    subtitle = "Nested rows: confounding (outer) and design IV strength (inner) · Columns: IV pattern",
+    x = expression("Wald "*chi^2*" (df = 1)"),
+    y = "Count"
+  ) +
+  theme_minimal(base_size = 11) +
+  theme(
+    strip.text = element_text(size = 9, face = "bold"),
+    panel.grid.minor = element_blank()
+  )
+save_bridge(p_bridge2, "BRIDGE_wald_hist_by_pattern.png", w = 18, h = 14)
+
+# --------------------------
+# Bridge 3: DGM IV exposure (x) → realized Wald (y), per Pattern, faceted by Confounding
+# --------------------------
+p_bridge3 <- ggplot(
+  md_bridge,
+  aes(x = iv_strength_num, y = wald_stat, colour = pattern_disp)
+) +
+  geom_point(alpha = 0.35, size = 1.1) +
+  geom_smooth(method = "lm", formula = y ~ poly(x, 2), se = FALSE, linewidth = 1) +
+  facet_wrap(~ confounding_disp, ncol = 2) +
+  scale_x_continuous(breaks = iv_levels, labels = sprintf("%.1f", iv_levels)) +
+  labs(
+    title    = "Design IV Exposure vs Realized First-stage Strength",
+    subtitle = "Quadratic fit per IV pattern within each confounding level",
+    x        = "Design IV exposure (DGM)",
+    y        = expression("Wald "*chi^2*" (df = 1)"),
+    colour   = "IV Pattern"
+  ) +
+  theme_minimal(base_size = 12) +
+  theme(
+    panel.grid.minor = element_blank(),
+    strip.text = element_text(face = "bold")
+  )
+save_bridge(p_bridge3, "BRIDGE_iv_dgm_to_wald.png", w = 16, h = 10)
+
+
+###############################################################################
+### APPENDIX: Assumption Violation Analysis
+###############################################################################
+
+appendix_dir <- file.path(results_folder, "appendix_violations")
+dir.create(appendix_dir, recursive = TRUE, showWarnings = FALSE)
+
+save_appendix <- function(p, filename, w = 12, h = 10, dpi = 300) {
+  ggplot2::ggsave(
+    filename = file.path(appendix_dir, filename),
+    plot = p, width = w, height = h, dpi = dpi, bg = "white", device = "png"
+  )
+}
+
+# ---------- Filter to assumption-violation scenarios ----------
+# Pattern 1, IV strength 0.8, strong/vstrong, all violation types
+appendix_md <- md_ok_all %>%
+  filter(
+    pattern == "1",
+    iv_strength == 0.8,
+    confounding %in% c("strong", "vstrong")
+  ) %>%
+  mutate(
+    conf_lab = factor(
+      ifelse(as.character(confounding) == "vstrong", "very strong", as.character(confounding)),
+      levels = c("strong", "very strong"), ordered = TRUE
+    ),
+    violation_lab = factor(
+      violation_type,
+      levels = c("valid", "exclusion", "independence"),
+      labels = c("Valid IV", "Exclusion Violation", "Independence Violation"),
+      ordered = TRUE
+    )
+  )
+
+print(table(appendix_md$conf_lab, appendix_md$violation_lab))
+
+# ---------- Reshape to long format ----------
+appendix_long <- bind_rows(
+  appendix_md %>%
+    transmute(conf_lab, violation_lab, method = "2SRI",
+              estimate = estimate_2sri, se = se_2sri),
+  appendix_md %>%
+    transmute(conf_lab, violation_lab, method = "Naive",
+              estimate = estimate_naive, se = se_naive)
+) %>%
+  mutate(
+    ciL = estimate - 1.96 * se,
+    ciU = estimate + 1.96 * se,
+    cover = as.integer(ciL <= true_effect & ciU >= true_effect),
+    method = factor(method, levels = c("2SRI", "Naive"))
+  )
+
+# ---------- Compute cell-level summaries ----------
+appendix_stats <- appendix_long %>%
+  group_by(conf_lab, violation_lab, method) %>%
+  summarise(
+    n = n(),
+    mean_est = mean(estimate, na.rm = TRUE),
+    
+    # Relative bias (%)
+    rel_bias_pct = abs(mean_est - true_effect) / abs(true_effect) * 100,
+    mcse_mean    = sd(estimate, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    mcse_relbias = (mcse_mean / abs(true_effect)) * 100,
+    rel_L        = pmax(0, rel_bias_pct - 1.96 * mcse_relbias),
+    rel_U        = rel_bias_pct + 1.96 * mcse_relbias,
+    
+    # Empirical SE
+    emp_se   = sd(estimate, na.rm = TRUE),
+    mcse_emp = ifelse(n > 1, emp_se / sqrt(2 * (n - 1)), NA_real_),
+    emp_L    = pmax(0, emp_se - 1.96 * mcse_emp),
+    emp_U    = emp_se + 1.96 * mcse_emp,
+    
+    # MSE
+    mse      = mean((estimate - true_effect)^2, na.rm = TRUE),
+    mcse_mse = sd((estimate - true_effect)^2, na.rm = TRUE) / sqrt(pmax(n, 1)),
+    mse_L    = pmax(0, mse - 1.96 * mcse_mse),
+    mse_U    = mse + 1.96 * mcse_mse,
+    
+    # Coverage
+    coverage = mean(cover, na.rm = TRUE),
+    mcse_cov = sqrt(coverage * (1 - coverage) / pmax(n, 1)),
+    cov_L    = pmin(pmax(coverage - 1.96 * mcse_cov, 0), 1),
+    cov_U    = pmin(pmax(coverage + 1.96 * mcse_cov, 0), 1),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    row_label = paste0(violation_lab, " - ", method),
+    row_label = factor(row_label, levels = rev(c(
+      "Valid IV - 2SRI", "Valid IV - Naive",
+      "Exclusion Violation - 2SRI", "Exclusion Violation - Naive",
+      "Independence Violation - 2SRI", "Independence Violation - Naive"
+    )))
+  )
+
+# ---------- Forest plot theme ----------
+forest_theme_app <- theme_minimal(base_size = 11) +
+  theme(
+    panel.border     = element_rect(color = "grey50", fill = NA, linewidth = 0.4),
+    panel.grid.minor = element_blank(),
+    strip.background = element_rect(fill = "grey92", color = "grey75"),
+    strip.text       = element_text(face = "bold", size = 12),
+    axis.text.y      = element_text(size = 9),
+    legend.position  = "none"
+  )
+
+# ---------- Figure A1: Strong Confounding ----------
+stats_strong <- appendix_stats %>% filter(conf_lab == "strong")
+
+p_rel_str <- ggplot(stats_strong, aes(y = row_label, x = rel_bias_pct)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = rel_L, xmax = rel_U), height = 0.25) +
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.3) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Relative Bias (%)", x = "Relative bias (%)", y = NULL) +
+  forest_theme_app
+
+p_cov_str <- ggplot(stats_strong, aes(y = row_label, x = coverage)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = cov_L, xmax = cov_U), height = 0.25) +
+  geom_vline(xintercept = 0.95, linetype = 3, linewidth = 0.4) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Coverage (95% CI)", x = "Coverage", y = NULL) +
+  forest_theme_app
+
+p_se_str <- ggplot(stats_strong, aes(y = row_label, x = emp_se)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = emp_L, xmax = emp_U), height = 0.25) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Empirical SE", x = "Empirical SE", y = NULL) +
+  forest_theme_app
+
+p_mse_str <- ggplot(stats_strong, aes(y = row_label, x = mse)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = mse_L, xmax = mse_U), height = 0.25) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Mean Squared Error (MSE)", x = "MSE", y = NULL) +
+  forest_theme_app
+
+fig_A1 <- (p_rel_str | p_cov_str) / (p_se_str | p_mse_str) +
+  patchwork::plot_annotation(
+    title = "Figure A1: Performance Under IV Assumption Violations (Strong Confounding)",
+    subtitle = "Pattern 1 (balanced), IV strength = 0.8",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5)
+    )
+  )
+save_appendix(fig_A1, "FigA1_violations_strong.png", w = 14, h = 10)
+
+# ---------- Figure A2: Very Strong Confounding ----------
+stats_vstrong <- appendix_stats %>% filter(conf_lab == "very strong")
+
+p_rel_vs <- ggplot(stats_vstrong, aes(y = row_label, x = rel_bias_pct)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = rel_L, xmax = rel_U), height = 0.25) +
+  geom_vline(xintercept = 0, linetype = 2, linewidth = 0.3) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Relative Bias (%)", x = "Relative bias (%)", y = NULL) +
+  forest_theme_app
+
+p_cov_vs <- ggplot(stats_vstrong, aes(y = row_label, x = coverage)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = cov_L, xmax = cov_U), height = 0.25) +
+  geom_vline(xintercept = 0.95, linetype = 3, linewidth = 0.4) +
+  scale_x_continuous(limits = c(0, 1), labels = scales::percent_format(accuracy = 1)) +
+  labs(title = "Coverage (95% CI)", x = "Coverage", y = NULL) +
+  forest_theme_app
+
+p_se_vs <- ggplot(stats_vstrong, aes(y = row_label, x = emp_se)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = emp_L, xmax = emp_U), height = 0.25) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Empirical SE", x = "Empirical SE", y = NULL) +
+  forest_theme_app
+
+p_mse_vs <- ggplot(stats_vstrong, aes(y = row_label, x = mse)) +
+  geom_point(size = 2.5) +
+  geom_errorbarh(aes(xmin = mse_L, xmax = mse_U), height = 0.25) +
+  scale_x_continuous(expand = expansion(mult = c(0.02, 0.08))) +
+  labs(title = "Mean Squared Error (MSE)", x = "MSE", y = NULL) +
+  forest_theme_app
+
+fig_A2 <- (p_rel_vs | p_cov_vs) / (p_se_vs | p_mse_vs) +
+  patchwork::plot_annotation(
+    title = "Figure A2: Performance Under IV Assumption Violations (Very Strong Confounding)",
+    subtitle = "Pattern 1 (balanced), IV strength = 0.8",
+    theme = theme(
+      plot.title = element_text(size = 14, face = "bold", hjust = 0.5),
+      plot.subtitle = element_text(size = 10, hjust = 0.5)
+    )
+  )
+save_appendix(fig_A2, "FigA2_violations_verystrong.png", w = 14, h = 10)
+
+# ---------- Table A1: Summary statistics ----------
+table_A1 <- appendix_stats %>%
+  select(conf_lab, violation_lab, method,
+         rel_bias_pct, mcse_relbias,
+         emp_se, mcse_emp,
+         mse, mcse_mse,
+         coverage, mcse_cov, n) %>%
+  arrange(conf_lab, violation_lab, method)
+
+readr::write_csv(table_A1, file.path(appendix_dir, "TableA1_violations_summary.csv"))
+
+# LaTeX version
+latex_A1 <- table_A1 %>%
+  transmute(
+    Confounding = conf_lab,
+    `Assumption` = violation_lab,
+    Method = method,
+    `Rel. Bias (\\%)` = sprintf("%.1f (%.1f)", rel_bias_pct, mcse_relbias),
+    `Emp. SE` = sprintf("%.3f (%.3f)", emp_se, mcse_emp),
+    `MSE` = sprintf("%.3f (%.3f)", mse, mcse_mse),
+    `Coverage` = sprintf("%.1f\\%% (%.1f\\%%)", 100*coverage, 100*mcse_cov),
+    n = n
+  )
+
+kable_A1 <- knitr::kable(
+  latex_A1, format = "latex", booktabs = TRUE, escape = FALSE,
+  caption = "Performance under IV assumption violations (Pattern 1, IV strength = 0.8). Values show point estimates with Monte Carlo SEs in parentheses."
+) |>
+  kableExtra::kable_styling(latex_options = c("hold_position"), font_size = 9) |>
+  kableExtra::add_header_above(c("Scenario" = 3, "Performance (value; MCSE)" = 4, " " = 1))
+
+kableExtra::save_kable(kable_A1, file.path(appendix_dir, "TableA1_violations_summary.tex"))
+
+
+
+
