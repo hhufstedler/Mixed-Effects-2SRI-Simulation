@@ -4,12 +4,20 @@ Simulation code for "Mixed-Effects Two-Stage Residual Inclusion Methods for Indi
 
 ## Description
 
-This R script implements a Monte Carlo simulation study evaluating mixed-effects 2SRI against naive Cox regression across 48 scenarios varying:
-- Unmeasured confounding (weak, moderate, strong, very strong)
-- Instrument-treatment association (0.3, 0.5, 0.8, 1.0)
-- IV allocation patterns (3 patterns)
+This R script implements a Monte Carlo simulation study evaluating mixed-effects two-stage residual inclusion (2SRI) against naive Cox regression for individual patient data meta-analysis with time-to-event outcomes.
 
-Each scenario runs 1,000 replications (N=48,000 total simulations).
+The script evaluates 52 total simulation scenarios:
+
+- 48 main valid-IV scenarios varying:
+  - Unmeasured confounding: weak, moderate, strong, very strong
+  - Instrument-treatment association: 0.3, 0.5, 0.8, 1.0
+  - IV allocation pattern: 3 patterns
+
+- 4 appendix IV assumption-violation scenarios under Pattern 1, IV strength 0.8, and strong/very strong confounding:
+  - Exclusion restriction violation
+  - Independence violation
+
+Each scenario runs 1,000 replications, for 52,000 total simulation replications.
 
 ## Requirements
 
